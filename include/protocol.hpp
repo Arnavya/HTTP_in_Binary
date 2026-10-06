@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <stdexcept>
 
 #include <arpa/inet.h>   // htonl/ntohl/htons/ntohs (Portable across POSIX)
@@ -197,6 +198,88 @@ constexpr uint32_t MAX_PAYLOAD_LENGTH = 16u * 1024u * 1024u;
 // must still be consumed and skipped using payload_length.
 inline bool isKnownFrameType(uint8_t t) {
     return t == FRAME_HEADERS || t == FRAME_DATA || t == FRAME_RST;
+}
+
+// ---------------------------------------------------------------------------
+// 7. Header block (de)serialization
+// ---------------------------------------------------------------------------
+// A decoded header, name/value kept as text regardless of how it was framed.
+//
+struct Header {
+    std::string name;
+    std::string value;
+};
+
+// Big-endian 16-bit append/read on a byte buffer.
+inline void appendU16BE(std::vector<uint8_t>& out, uint16_t v) {
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
+    out.push_back(static_cast<uint8_t>(v & 0xff));
+}
+
+// Reads a big-endian uint16 at data[off], advancing off. False if it would
+// read past the end.
+inline bool readU16BE(const uint8_t* data, std::size_t len,
+                      std::size_t& off, uint16_t& out) {
+    if (off + 2 > len) return false;
+    out = static_cast<uint16_t>((data[off] << 8) | data[off + 1]);
+    off += 2;
+    return true;
+}
+
+// Append one name/value pair to a HEADERS payload, applying the well-known
+// id compression where possible (see HeaderId). Throws std::length_error if a
+// name or value exceeds the 16-bit length field.
+inline void appendHeader(std::vector<uint8_t>& out,
+                         const std::string& name, const std::string& value) {
+    if (value.size() > 0xffff)
+        throw std::length_error("header value exceeds 65535 bytes");
+
+    uint8_t id = headerIdForName(name);
+    out.push_back(id);
+    if (id == HEADER_EXTENDED) {
+        if (name.size() > 0xffff)
+            throw std::length_error("header name exceeds 65535 bytes");
+        appendU16BE(out, static_cast<uint16_t>(name.size()));
+        out.insert(out.end(), name.begin(), name.end());
+    }
+    appendU16BE(out, static_cast<uint16_t>(value.size()));
+    out.insert(out.end(), value.begin(), value.end());
+}
+
+// Parse a complete HEADERS payload into name/value pairs.
+//
+// Returns false if the block is malformed: truncated length prefix, a value
+// that runs past the end, or a single-byte id that is neither EXTENDED nor a
+// known HeaderId. On false the contents of `out` are undefined.
+//
+inline bool parseHeaderBlock(const uint8_t* data, std::size_t len,
+                             std::vector<Header>& out) {
+    std::size_t off = 0;
+    while (off < len) {
+        uint8_t id = data[off++];
+        std::string name;
+
+        if (id == HEADER_EXTENDED) {
+            uint16_t nlen = 0;
+            if (!readU16BE(data, len, off, nlen)) return false;
+            if (off + nlen > len) return false;
+            name.assign(reinterpret_cast<const char*>(data + off), nlen);
+            off += nlen;
+        } else {
+            const char* known = headerIdName(static_cast<HeaderId>(id));
+            if (known == nullptr) return false;   // unknown compressed id
+            name = known;
+        }
+
+        uint16_t vlen = 0;
+        if (!readU16BE(data, len, off, vlen)) return false;
+        if (off + vlen > len) return false;
+        std::string value(reinterpret_cast<const char*>(data + off), vlen);
+        off += vlen;
+
+        out.push_back(Header{std::move(name), std::move(value)});
+    }
+    return true;
 }
 
 } // namespace bitmid

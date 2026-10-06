@@ -5,17 +5,18 @@
 //   ./bserve <root-dir> <port>
 //   ./bserve ./www 9000
 //
-// Step 2 scope: wire up the network plumbing only.
-//   * parse + validate arguments
-//   * create a TCP listening socket (SO_REUSEADDR)
-//   * accept connections, one at a time
-//   * hold each connection OPEN and read frames in a persistent loop until
-//     the peer closes it or a fatal error occurs
+// Step 3 scope:
+//   * turn the Step 2 stub into a real request parser
+//   * validate frame headers (stream id, reserved flag bits, frame ordering)
+//   * validate the serialized header block inside HEADERS frames
+//   * skip unknown frame types cleanly using their declared payload length
+//   * answer a malformed request with a 400 response instead of crashing
 //
-// Frame *interpretation* (validation, file mapping, responses) lands in later
-// steps; here we only frame the bytes and hand them to a stub.
+// File mapping / 200 / 404 live in Step 4. Here a well-formed request is parsed
+// and logged, then the connection waits for the next one.
 //
 #include "protocol.hpp"
+#include "frame_io.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -44,96 +45,162 @@ void onSignal(int /*signum*/) {
 }
 
 // ---------------------------------------------------------------------------
-// I/O helpers
+// Response building
 // ---------------------------------------------------------------------------
-// recv()/send() may return short counts and may be interrupted by signals.
-// These wrappers loop until the requested number of bytes is transferred.
+// A response is a HEADERS frame (Status / Content-Type / Content-Length)
+// followed by a DATA frame carrying the body. If the body is empty we can put
+// END_STREAM on the HEADERS frame and skip DATA entirely.
 //
-// Return true on full transfer, false on EOF or a non-retryable error.
-// `out_eof` (optional) distinguishes a clean shutdown from a hard error.
-//
-bool readFull(int fd, void* buf, std::size_t n, bool* out_eof = nullptr) {
-    auto* p = static_cast<uint8_t*>(buf);
-    std::size_t got = 0;
-    while (got < n) {
-        ssize_t r = ::recv(fd, p + got, n - got, 0);
-        if (r == 0) {                       // orderly shutdown by peer
-            if (out_eof) *out_eof = true;
-            return false;
-        }
-        if (r < 0) {
-            if (errno == EINTR) continue;   // retry after a signal
-            if (out_eof) *out_eof = false;
-            return false;
-        }
-        got += static_cast<std::size_t>(r);
+bool sendResponse(int fd, int status, const std::string& content_type,
+                  const std::string& body) {
+    std::vector<uint8_t> hblock;
+    try {
+        appendHeader(hblock, "Status", std::to_string(status));
+        appendHeader(hblock, "Content-Type", content_type);
+        appendHeader(hblock, "Content-Length", std::to_string(body.size()));
+    } catch (const std::exception&) {
+        return false;   // a field exceeded the 16-bit length; nothing to send
     }
-    return true;
+
+    if (body.empty()) {
+        // Single frame, stream done.
+        return writeFrameVec(fd, FRAME_HEADERS, FLAG_END_STREAM, 0, hblock);
+    }
+
+    if (!writeFrameVec(fd, FRAME_HEADERS, FLAG_NONE, 0, hblock)) return false;
+    return writeFrame(fd, FRAME_DATA, FLAG_END_STREAM, 0, body.data(),
+                      static_cast<uint32_t>(body.size()));
 }
 
-[[maybe_unused]] bool writeFull(int fd, const void* buf, std::size_t n) {
-    const auto* p = static_cast<const uint8_t*>(buf);
-    std::size_t sent = 0;
-    while (sent < n) {
-        ssize_t r = ::send(fd, p + sent, n - sent, 0);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        sent += static_cast<std::size_t>(r);
-    }
-    return true;
+bool sendError(int fd, int status, const std::string& message) {
+    return sendResponse(fd, status, "text/plain", message + "\n");
 }
 
 // ---------------------------------------------------------------------------
-// Frame handling (stub)
+// Per-request parse state
 // ---------------------------------------------------------------------------
-// Step 3 replaces this with real validation, unknown-type skipping, and
-// malformed-frame handling. For now we log what arrived and keep going so the
-// persistent loop is exercised end to end.
+// One request = HEADERS frame (optionally extended by more HEADERS frames and
+// DATA frames) terminated by the END_STREAM flag.
 //
-void handleFrame(int /*fd*/, const FrameHeader& h,
-                 const std::vector<uint8_t>& payload) {
-    std::fprintf(stderr,
-                 "[bserve] frame type=0x%02x flags=0x%02x stream=%u len=%u\n",
-                 h.frame_type, h.flags, h.stream_id, h.payload_length);
-    (void)payload;
+struct RequestState {
+    bool got_headers = false;      // at least one HEADERS frame seen
+    std::vector<Header> headers;   // accumulated name/value pairs
+
+    void reset() {
+        got_headers = false;
+        headers.clear();
+    }
+};
+
+void logRequest(const RequestState& req) {
+    std::fprintf(stderr, "[bserve] request complete (%zu headers):\n",
+                 req.headers.size());
+    for (const auto& kv : req.headers)
+        std::fprintf(stderr, "           %s: %s\n",
+                     kv.name.c_str(), kv.value.c_str());
+    // Step 4 will map Method/Path/Host to a file here.
+}
+
+// ---------------------------------------------------------------------------
+// Frame dispatch
+// ---------------------------------------------------------------------------
+// Returns false if the connection must be closed (fatal, unrecoverable), true
+// to keep serving (including after a recoverable 400).
+//
+bool handleFrame(int fd, const FrameHeader& h,
+                 const std::vector<uint8_t>& payload, RequestState& req) {
+    // --- Common header-field validation for every frame -------------------
+    if (h.stream_id != 0) {
+        sendError(fd, 400, "bad request: non-zero stream id");
+        req.reset();
+        return true;   // recoverable: whole payload was consumed
+    }
+    if ((h.flags & ~FLAG_END_STREAM) != 0) {
+        sendError(fd, 400, "bad request: reserved flag bits set");
+        req.reset();
+        return true;
+    }
+
+    // --- Unknown frame type: skip its payload and carry on -----------------
+    // The bytes are already read by readFrame(), so "skipping" is simply an
+    // early return. We must NOT close the connection or reset the request.
+    if (!isKnownFrameType(h.frame_type)) {
+        std::fprintf(stderr,
+                     "[bserve] skipping unknown frame type 0x%02x (%u bytes)\n",
+                     h.frame_type, h.payload_length);
+        return true;
+    }
+
+    const bool end_stream = (h.flags & FLAG_END_STREAM) != 0;
+
+    switch (h.frame_type) {
+        case FRAME_HEADERS: {
+            std::vector<Header> parsed;
+            if (!parseHeaderBlock(payload.data(), payload.size(), parsed)) {
+                sendError(fd, 400, "bad request: malformed header block");
+                req.reset();
+                return true;
+            }
+            for (auto& kv : parsed) req.headers.push_back(std::move(kv));
+            req.got_headers = true;
+            break;
+        }
+
+        case FRAME_DATA: {
+            if (!req.got_headers) {
+                sendError(fd, 400, "bad request: DATA before HEADERS");
+                req.reset();
+                return true;
+            }
+            // Step 4: request bodies would be accumulated here.
+            break;
+        }
+
+        case FRAME_RST: {
+            // Peer aborted the exchange; drop partial state, stay connected.
+            req.reset();
+            return true;
+        }
+
+        default:
+            break;   // unreachable: filtered by isKnownFrameType
+    }
+
+    if (end_stream) {
+        if (!req.got_headers) {
+            sendError(fd, 400, "bad request: stream ended without HEADERS");
+            req.reset();
+            return true;
+        }
+        logRequest(req);
+        req.reset();
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 // Per-connection loop: KEEP THE CONNECTION OPEN across many requests.
 // ---------------------------------------------------------------------------
 void serveConnection(int fd) {
+    RequestState req;
+
     while (g_running) {
-        // 1) Read the fixed 8-byte frame header.
-        uint8_t header_bytes[8];
-        bool eof = false;
-        if (!readFull(fd, header_bytes, sizeof(header_bytes), &eof)) {
-            if (!eof) std::perror("[bserve] recv header");
-            break;  // clean close or error: drop this connection, keep server up
-        }
+        FrameHeader h;
+        std::vector<uint8_t> payload;
+        std::string err;
 
-        FrameHeader h = parseFrameHeader(header_bytes);
+        FrameStatus st = readFrame(fd, h, payload, MAX_PAYLOAD_LENGTH, &err);
+        if (st == FrameStatus::CleanEof) break;
 
-        // 2) Sanity-check the declared length before allocating.
-        if (h.payload_length > MAX_PAYLOAD_LENGTH) {
-            std::fprintf(stderr,
-                         "[bserve] payload length %u exceeds cap, closing\n",
-                         h.payload_length);
+        if (st == FrameStatus::Error) {
+            // Either a socket error or an over-long declared length. We cannot
+            // resynchronize the byte stream, so tell the peer and close.
+            std::fprintf(stderr, "[bserve] frame error: %s\n", err.c_str());
+            sendError(fd, 400, "bad request: " + err);
             break;
         }
 
-        // 3) Read exactly payload_length bytes (none if zero).
-        std::vector<uint8_t> payload(h.payload_length);
-        if (h.payload_length != 0) {
-            if (!readFull(fd, payload.data(), payload.size(), &eof)) {
-                if (!eof) std::perror("[bserve] recv payload");
-                break;
-            }
-        }
-
-        // 4) Dispatch. Connection intentionally stays open afterwards.
-        handleFrame(fd, h, payload);
+        if (!handleFrame(fd, h, payload, req)) break;
     }
 }
 
@@ -178,8 +245,6 @@ bool parseArgs(int argc, char** argv, Options& opts) {
 // ---------------------------------------------------------------------------
 // Socket setup
 // ---------------------------------------------------------------------------
-// Create, bind and listen a TCP socket. Returns the fd, or -1 on error.
-//
 int createListenSocket(uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -187,7 +252,6 @@ int createListenSocket(uint16_t port) {
         return -1;
     }
 
-    // Reuse the address so a restart doesn't fail on a lingering TIME_WAIT.
     int on = 1;
     if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
         std::perror("[bserve] setsockopt(SO_REUSEADDR)");
@@ -197,15 +261,14 @@ int createListenSocket(uint16_t port) {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);      // bind all interfaces
-    addr.sin_port = htons(port);                   // network byte order
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
 
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         std::perror("[bserve] bind");
         ::close(fd);
         return -1;
     }
-
     if (::listen(fd, /*backlog=*/16) < 0) {
         std::perror("[bserve] listen");
         ::close(fd);
@@ -223,12 +286,8 @@ int main(int argc, char** argv) {
     Options opts;
     if (!parseArgs(argc, argv, opts)) return 1;
 
-    // Install signal handlers so Ctrl-C unwinds cleanly.
-    //
-    // We use sigaction with sa_flags = 0 (NO SA_RESTART) on purpose: that makes
-    // a blocking accept() return EINTR when a signal arrives, which is exactly
-    // how the loop below notices g_running == 0. std::signal() would set
-    // SA_RESTART and silently restart accept() forever.
+    // sigaction with sa_flags = 0 (NO SA_RESTART) so a blocking accept()
+    // returns EINTR and the loop sees g_running == 0.
     struct sigaction sa{};
     sa.sa_handler = onSignal;   // sa_mask is empty thanks to value-init
     sa.sa_flags = 0;
@@ -242,14 +301,13 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "[bserve] serving %s on port %u\n",
                  opts.root_dir.c_str(), opts.port);
 
-    // Accept loop. One client at a time is sufficient for this project.
     while (g_running) {
         sockaddr_in peer{};
         socklen_t peer_len = sizeof(peer);
         int client = ::accept(listen_fd, reinterpret_cast<sockaddr*>(&peer),
                               &peer_len);
         if (client < 0) {
-            if (errno == EINTR) continue;   // signal: re-check g_running
+            if (errno == EINTR) continue;
             std::perror("[bserve] accept");
             continue;
         }
@@ -259,7 +317,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[bserve] connection from %s:%u\n",
                      peer_ip, ntohs(peer.sin_port));
 
-        serveConnection(client);            // runs until peer closes
+        serveConnection(client);
 
         ::close(client);
         std::fprintf(stderr, "[bserve] connection closed\n");
