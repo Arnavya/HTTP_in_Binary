@@ -24,12 +24,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -51,6 +53,10 @@ void onSignal(int /*signum*/) {
 // followed by a DATA frame carrying the body. If the body is empty we can put
 // END_STREAM on the HEADERS frame and skip DATA entirely.
 //
+// Data payloads are split into chunks so a large file never has to fit in a
+// single frame (and never exceeds MAX_PAYLOAD_LENGTH on the receiver side).
+constexpr std::size_t DATA_CHUNK_SIZE = 64 * 1024;
+
 bool sendResponse(int fd, int status, const std::string& content_type,
                   const std::string& body) {
     std::vector<uint8_t> hblock;
@@ -68,8 +74,19 @@ bool sendResponse(int fd, int status, const std::string& content_type,
     }
 
     if (!writeFrameVec(fd, FRAME_HEADERS, FLAG_NONE, 0, hblock)) return false;
-    return writeFrame(fd, FRAME_DATA, FLAG_END_STREAM, 0, body.data(),
-                      static_cast<uint32_t>(body.size()));
+
+    // Then one or more DATA frames; the final one carries END_STREAM.
+    std::size_t off = 0;
+    while (off < body.size()) {
+        std::size_t n = std::min(DATA_CHUNK_SIZE, body.size() - off);
+        bool last = (off + n) == body.size();
+        uint8_t flags = last ? FLAG_END_STREAM : FLAG_NONE;
+        if (!writeFrame(fd, FRAME_DATA, flags, 0, body.data() + off,
+                        static_cast<uint32_t>(n)))
+            return false;
+        off += n;
+    }
+    return true;
 }
 
 bool sendError(int fd, int status, const std::string& message) {
@@ -92,13 +109,115 @@ struct RequestState {
     }
 };
 
-void logRequest(const RequestState& req) {
-    std::fprintf(stderr, "[bserve] request complete (%zu headers):\n",
-                 req.headers.size());
+// ---------------------------------------------------------------------------
+// Header lookup
+// ---------------------------------------------------------------------------
+const std::string* findHeader(const RequestState& req, const char* name) {
     for (const auto& kv : req.headers)
-        std::fprintf(stderr, "           %s: %s\n",
-                     kv.name.c_str(), kv.value.c_str());
-    // Step 4 will map Method/Path/Host to a file here.
+        if (kv.name == name) return &kv.value;
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// File-system mapping
+// ---------------------------------------------------------------------------
+// Map a request path ("/index.html") under the document root.
+//
+// Returns false if the path tries to escape the root (any ".." component) or
+// fails to build. A false return is reported to the client as 404 so we never
+// leak whether an out-of-root file exists.
+//
+bool resolvePath(const std::string& root_dir, const std::string& req_path,
+                 std::string& out) {
+    if (req_path.empty() || req_path[0] != '/') return false;
+
+    // Reject directory traversal up front.
+    std::size_t pos = 0;
+    while (pos < req_path.size()) {
+        std::size_t next = req_path.find('/', pos);
+        std::string comp = req_path.substr(
+            pos, next == std::string::npos ? std::string::npos : next - pos);
+        if (comp == "..") return false;
+        if (next == std::string::npos) break;
+        pos = next + 1;
+    }
+
+    // A trailing '/' means "serve the directory index".
+    std::string rel = req_path;
+    if (rel.back() == '/') rel += "index.html";
+
+    out = root_dir + rel;
+    return true;
+}
+
+// Best-effort MIME type from the file extension.
+const char* contentTypeFor(const std::string& path) {
+    auto endsWith = [&](const char* suf) {
+        std::size_t n = std::strlen(suf);
+        return path.size() >= n && path.compare(path.size() - n, n, suf) == 0;
+    };
+    if (endsWith(".html") || endsWith(".htm")) return "text/html";
+    if (endsWith(".txt"))  return "text/plain";
+    if (endsWith(".css"))  return "text/css";
+    if (endsWith(".js"))   return "application/javascript";
+    if (endsWith(".json")) return "application/json";
+    if (endsWith(".png"))  return "image/png";
+    if (endsWith(".jpg") || endsWith(".jpeg")) return "image/jpeg";
+    if (endsWith(".gif"))  return "image/gif";
+    return "application/octet-stream";
+}
+
+// Read a whole file into memory. False on open/read failure.
+bool readFile(const std::string& fs_path, std::string& out) {
+    std::ifstream in(fs_path, std::ios::binary);
+    if (!in) return false;
+    out.assign(std::istreambuf_iterator<char>(in),
+               std::istreambuf_iterator<char>());
+    return in.good() || in.eof();
+}
+
+// ---------------------------------------------------------------------------
+// Turn a completed request into a response
+// ---------------------------------------------------------------------------
+void finishRequest(int fd, const RequestState& req, const std::string& root_dir) {
+    const std::string* method   = findHeader(req, "Method");
+    const std::string* req_path = findHeader(req, "Path");
+
+    if (!method || !req_path || method->empty() || req_path->empty()) {
+        sendError(fd, 400, "bad request: missing Method or Path");
+        return;
+    }
+
+    // Only GET is supported by this server.
+    if (*method != "GET") {
+        sendError(fd, 405, "method not allowed: only GET is supported");
+        return;
+    }
+
+    // Map the request path to a file under the document root.
+    std::string fs_path;
+    if (!resolvePath(root_dir, *req_path, fs_path)) {
+        sendError(fd, 404, "not found: " + *req_path);
+        return;
+    }
+
+    struct stat st{};
+    if (::stat(fs_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+        sendError(fd, 404, "not found: " + *req_path);
+        return;
+    }
+
+    std::string body;
+    if (!readFile(fs_path, body)) {
+        sendError(fd, 500, "internal error: cannot read file");
+        return;
+    }
+
+    std::fprintf(stderr, "[bserve] 200 GET %s (%zu bytes, %s)\n",
+                 req_path->c_str(), body.size(), contentTypeFor(fs_path));
+    if (!sendResponse(fd, 200, contentTypeFor(fs_path), body))
+        std::fprintf(stderr, "[bserve] failed to send response for %s\n",
+                     req_path->c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +227,8 @@ void logRequest(const RequestState& req) {
 // to keep serving (including after a recoverable 400).
 //
 bool handleFrame(int fd, const FrameHeader& h,
-                 const std::vector<uint8_t>& payload, RequestState& req) {
+                 const std::vector<uint8_t>& payload, RequestState& req,
+                 const std::string& root_dir) {
     // --- Common header-field validation for every frame -------------------
     if (h.stream_id != 0) {
         sendError(fd, 400, "bad request: non-zero stream id");
@@ -172,7 +292,7 @@ bool handleFrame(int fd, const FrameHeader& h,
             req.reset();
             return true;
         }
-        logRequest(req);
+        finishRequest(fd, req, root_dir);
         req.reset();
     }
     return true;
@@ -181,7 +301,7 @@ bool handleFrame(int fd, const FrameHeader& h,
 // ---------------------------------------------------------------------------
 // Per-connection loop: KEEP THE CONNECTION OPEN across many requests.
 // ---------------------------------------------------------------------------
-void serveConnection(int fd) {
+void serveConnection(int fd, const std::string& root_dir) {
     RequestState req;
 
     while (g_running) {
@@ -200,7 +320,7 @@ void serveConnection(int fd) {
             break;
         }
 
-        if (!handleFrame(fd, h, payload, req)) break;
+        if (!handleFrame(fd, h, payload, req, root_dir)) break;
     }
 }
 
@@ -317,7 +437,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[bserve] connection from %s:%u\n",
                      peer_ip, ntohs(peer.sin_port));
 
-        serveConnection(client);
+        serveConnection(client, opts.root_dir);
 
         ::close(client);
         std::fprintf(stderr, "[bserve] connection closed\n");
