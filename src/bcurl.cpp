@@ -171,15 +171,57 @@ std::vector<uint8_t> buildRequestHeaders(const Options& opts) {
 }
 
 // ---------------------------------------------------------------------------
-// Response reading (Step 6 placeholder)
+// Hexdump (verbose only)
 // ---------------------------------------------------------------------------
-// For now: drain frames until END_STREAM (or EOF/error) and return the status
-// code parsed from the response HEADERS, or -1. Step 6 adds hexdumping,
-// stdout body output, and the process exit code.
+// Classic `hexdump -C` layout: offset, 16 hex bytes, ASCII gutter. Everything
+// goes to stderr so stdout stays reserved for the response body.
+//
+void hexdump(const uint8_t* data, std::size_t len) {
+    for (std::size_t off = 0; off < len; off += 16) {
+        std::fprintf(stderr, "%08zx  ", off);
+        for (std::size_t i = 0; i < 16; ++i) {
+            if (off + i < len)
+                std::fprintf(stderr, "%02x ", data[off + i]);
+            else
+                std::fprintf(stderr, "   ");
+            if (i == 7) std::fputc(' ', stderr);
+        }
+        std::fputc('|', stderr);
+        for (std::size_t i = 0; i < 16 && off + i < len; ++i) {
+            uint8_t c = data[off + i];
+            std::fputc((c >= 0x20 && c < 0x7f) ? c : '.', stderr);
+        }
+        std::fprintf(stderr, "|\n");
+    }
+}
+
+// Re-serialize a parsed frame back to its on-wire bytes (header + payload) and
+// dump it, preceded by a one-line human summary.
+void dumpFrame(const char* direction, const FrameHeader& h,
+               const std::vector<uint8_t>& payload) {
+    std::fprintf(stderr, "%s type=0x%02x flags=0x%02x stream=%u len=%u\n",
+                 direction, h.frame_type, h.flags, h.stream_id,
+                 h.payload_length);
+    std::vector<uint8_t> raw(8 + payload.size());
+    serializeFrameHeader(h, raw.data());
+    if (!payload.empty())
+        std::memcpy(raw.data() + 8, payload.data(), payload.size());
+    hexdump(raw.data(), raw.size());
+}
+
+// ---------------------------------------------------------------------------
+// Response reading
+// ---------------------------------------------------------------------------
+// Stream frames until END_STREAM (or EOF/error):
+//   * verbose: dump every frame, and print decoded response headers
+//   * DATA payloads are written to stdout as they arrive
+// Returns the HTTP-like status code, or -1 on I/O error / missing response /
+// peer reset.
 //
 int readResponse(int fd, bool verbose) {
-    (void)verbose;   // unused until Step 6
-    int status = -1;
+    int  status      = -1;
+    bool got_headers = false;
+    bool peer_reset  = false;
 
     while (true) {
         FrameHeader h;
@@ -190,19 +232,50 @@ int readResponse(int fd, bool verbose) {
         if (st == FrameStatus::CleanEof) break;
         if (st == FrameStatus::Error) {
             std::fprintf(stderr, "[bcurl] read error: %s\n", err.c_str());
-            break;
+            return -1;
         }
 
-        if (h.frame_type == FRAME_HEADERS) {
-            std::vector<Header> parsed;
-            if (parseHeaderBlock(payload.data(), payload.size(), parsed)) {
-                for (const auto& kv : parsed)
-                    if (kv.name == "Status") status = std::atoi(kv.value.c_str());
+        if (verbose) dumpFrame("<<<", h, payload);
+
+        // Unknown frame types are skipped using their declared length; they do
+        // not affect the current response.
+        if (!isKnownFrameType(h.frame_type)) continue;
+
+        switch (h.frame_type) {
+            case FRAME_HEADERS: {
+                std::vector<Header> parsed;
+                if (!parseHeaderBlock(payload.data(), payload.size(), parsed)) {
+                    std::fprintf(stderr, "[bcurl] malformed response headers\n");
+                    return -1;
+                }
+                got_headers = true;
+                for (const auto& kv : parsed) {
+                    if (verbose)
+                        std::fprintf(stderr, "        %s: %s\n",
+                                     kv.name.c_str(), kv.value.c_str());
+                    if (kv.name == "Status")
+                        status = std::atoi(kv.value.c_str());
+                }
+                break;
             }
+            case FRAME_DATA:
+                if (!payload.empty())
+                    std::fwrite(payload.data(), 1, payload.size(), stdout);
+                break;
+            case FRAME_RST:
+                peer_reset = true;
+                break;
+            default:
+                break;
         }
 
         if (h.flags & FLAG_END_STREAM) break;
     }
+
+    std::fflush(stdout);
+
+    if (peer_reset) return -1;
+    if (!got_headers || status < 0) return -1;
     return status;
 }
 
@@ -225,6 +298,14 @@ int main(int argc, char** argv) {
 
     // Build and send the request as a single HEADERS frame that ends the stream.
     std::vector<uint8_t> headers = buildRequestHeaders(opts);
+    if (opts.verbose) {
+        FrameHeader req;
+        req.payload_length = static_cast<uint32_t>(headers.size());
+        req.frame_type     = FRAME_HEADERS;
+        req.flags          = FLAG_END_STREAM;
+        req.stream_id      = 0;
+        dumpFrame(">>>", req, headers);
+    }
     if (!writeFrameVec(fd, FRAME_HEADERS, FLAG_END_STREAM, 0, headers)) {
         std::fprintf(stderr, "[bcurl] failed to send request\n");
         ::close(fd);
@@ -234,8 +315,13 @@ int main(int argc, char** argv) {
     int status = readResponse(fd, opts.verbose);
     ::close(fd);
 
-    // Exit-code policy is finalized in Step 6; report the status for now.
-    if (status < 0)
-        std::fprintf(stderr, "[bcurl] no response\n");
+    // Exit code: 0 for < 400, non-zero for 4xx/5xx, missing response, or I/O
+    // error. (2 is reserved for command-line / URL parse failures.)
+    if (status < 0) {
+        std::fprintf(stderr, "[bcurl] no valid response\n");
+        return 1;
+    }
+    if (status >= 400)
+        return 1;
     return 0;
 }
