@@ -1,0 +1,19 @@
+# Build output / binaries
+bserve
+bcurl
+*.o
+*.obj
+
+# CMake
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+
+# Editor / OS noise
+.DS_Store
+*.swp
+
+# Test data (created locally, not part of the deliverable)
+www/big.bin
